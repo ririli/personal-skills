@@ -1,0 +1,7 @@
+interface:
+  display_name: "互联网技术面试辅导"
+  short_description: "先理解原理，再组织面试回答；支持机制推导、追问纠错和项目分析"
+  default_prompt: "使用 $tech-interview-coach 帮我理解这个技术面试问题，并整理适合口述的回答。"
+
+policy:
+  allow_implicit_invocation: false
