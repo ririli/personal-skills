@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<title>Go 数据竞争派生树</title>
+<style>
+  :root {
+    color-scheme: light;
+    --ink: #142b30;
+    --muted: #496068;
+    --paper: #f3f6f5;
+    --line: #d2dfde;
+    --accent: #006760;
+    --accent-soft: #def3ef;
+    --warning: #8a480d;
+    --warning-soft: #fff0d4;
+    --mono: "IBM Plex Mono", Consolas, "Liberation Mono", monospace;
+    font: 15px/1.55 Inter, system-ui, "Microsoft YaHei UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--paper); color: var(--ink); }
+  h1, h2, h3, p, ul, ol { margin: 0; }
+  button, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  button:focus-visible, select:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
+    outline: 3px solid #07837a; outline-offset: 3px;
+  }
+  header { background: #123235; color: white; }
+  .mast {
+    max-width: 1360px;
+    margin-inline: auto;
+    padding: 28px 32px 27px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  h1 { font-size: clamp(1.45rem, 3vw, 2.1rem); letter-spacing: -.025em; line-height: 1.2; }
+  .picker { display: grid; gap: 5px; font-size: .86rem; color: #e4f3f0; }
+  select { min-width: 144px; padding: 6px 12px; border: 1px solid #799897; border-radius: 6px; background: #21484a; }
+  main { max-width: 1360px; margin-inline: auto; padding: 23px 32px 48px; }
+  .pair { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; }
+  .pair.single { grid-template-columns: minmax(0, 1fr); }
+  .access-card {
+    min-width: 0; min-height: 102px; text-align: left; padding: 13px 16px;
+    display: grid; gap: 4px; background: #fff; border: 1px solid var(--line); border-radius: 10px;
+  }
+  .access-card:hover, .access-card[aria-pressed="true"] { border-color: #14817a; background: #fafffe; }
+  .access-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-weight: 750; }
+  .access-letter, .access-chip {
+    font: 700 .83rem/1.3 var(--mono); border-radius: 4px; padding: 4px 6px;
+  }
+  .read { background: var(--accent-soft); color: #005b55; }
+  .write { background: var(--warning-soft); color: #783e0e; }
+  .access-symbol { overflow-wrap: anywhere; font: 600 .86rem/1.4 var(--mono); }
+  .access-meta { color: var(--muted); font: .76rem/1.45 var(--mono); overflow-wrap: anywhere; }
+  .pair-link {
+    position: relative; min-width: 106px; text-align: center; color: var(--warning); font-weight: 750; padding: 10px 12px;
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 7px; font-size: .79rem;
+  }
+  .pair-link::before, .pair-link::after { content: ""; width: 100%; border-top: 2px dashed #a46023; }
+  .warnings { background: #fff7e8; color: #704513; border: 1px solid #efd6a9; border-radius: 8px; padding: 10px 12px 10px 31px; margin-top: 12px; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(270px, 33%); align-items: start; gap: 16px; margin-top: 17px; }
+  .panel { min-width: 0; border: 1px solid var(--line); background: #fff; border-radius: 11px; }
+  .tree-head { display: grid; gap: 8px; border-bottom: 1px solid var(--line); padding: 15px 17px; }
+  h2 { font-size: 1.04rem; font-weight: 750; }
+  .relation { font-size: .87rem; color: var(--muted); overflow-wrap: anywhere; }
+  .relation strong { color: var(--ink); }
+  .legend { display: flex; gap: 8px 15px; flex-wrap: wrap; color: var(--muted); font-size: .76rem; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { display: inline-block; width: 21px; border-top: 2px solid #177d73; }
+  .legend .inferred { border-top: 2px dashed #9a581f; }
+  .viewport {
+    overflow: auto; min-height: 270px; max-height: min(65vh, 700px);
+    background: #f9fbfa radial-gradient(#d4e2df 1px, transparent 1px) 0 0 / 16px 16px;
+    border-radius: 0 0 11px 11px;
+  }
+  .chart { position: relative; display: grid; place-items: start center; width: max-content; min-width: 100%; padding: 26px 22px 32px; }
+  .chart canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+  .forest, .children, .branch { position: relative; display: flex; align-items: flex-start; }
+  .forest, .children { gap: 23px; }
+  .branch { flex-direction: column; align-items: center; gap: 12px; }
+  .children { padding-top: 20px; }
+  .node {
+    width: 218px; min-width: 0; background: #fff; border: 1px solid #aec5c2;
+    border-top: 3px solid #6b9590; border-radius: 8px; box-shadow: 0 3px 7px #1534360d;
+  }
+  .node.on-path { border-top-color: #00796e; }
+  .node.is-ancestor { border-color: #128076; background: #f1fcf9; }
+  .node.is-context { border-style: dashed; border-color: #a56c39; }
+  .node-button {
+    width: 100%; text-align: left; display: grid; gap: 3px; padding: 10px 11px;
+    border: 0; border-radius: 6px 6px 0 0; background: transparent;
+  }
+  .node-button:hover, .node-button[aria-pressed="true"] { background: #e7f6f3; }
+  .node-name { font-weight: 760; font-size: .89rem; overflow-wrap: anywhere; }
+  .node-note { font-size: .72rem; color: var(--muted); overflow-wrap: anywhere; }
+  .edge-label {
+    width: 192px; text-align: center; font-size: .69rem; color: #225851;
+    background: #f1f8f6; border: 1px solid #c1dbd6; border-radius: 5px; padding: 2px 5px;
+    overflow-wrap: anywhere; z-index: 1;
+  }
+  .edge-label.inferred { color: #804712; border-style: dashed; border-color: #ca9f76; background: #fff6e9; }
+  .node-accesses { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 10px 9px; }
+  .access-chip { border: 1px solid transparent; }
+  .access-chip:hover, .access-chip[aria-pressed="true"] { border-color: currentColor; }
+  .detail { padding: 15px 16px; }
+  .detail h2 { margin-bottom: 4px; }
+  .detail .caption { font-size: .81rem; color: var(--muted); margin-bottom: 12px; }
+  .detail section { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+  .detail h3 { font-size: .87rem; margin-bottom: 6px; }
+  .detail p, .detail li { overflow-wrap: anywhere; }
+  .detail section p { font-size: .81rem; color: var(--muted); white-space: pre-wrap; }
+  .frames { padding-left: 23px; }
+  .frames li { padding: 5px 0; }
+  .frames li::marker { color: var(--accent); font: .73rem var(--mono); }
+  .frames code { display: block; font: .79rem/1.4 var(--mono); }
+  .location { display: block; font: .73rem/1.45 var(--mono); color: var(--muted); margin-top: 2px; }
+  .evidence-item + .evidence-item { margin-top: 8px; }
+  .raw { margin-top: 16px; }
+  summary { cursor: pointer; padding: 11px 15px; font-weight: 650; }
+  .raw pre {
+    margin: 0; padding: 13px 15px; max-height: 32rem; overflow: auto; border-top: 1px solid var(--line);
+    white-space: pre-wrap; overflow-wrap: anywhere; font: .8rem/1.6 var(--mono);
+  }
+  .empty { padding: 12px; color: var(--muted); }
+  @media (max-width: 830px) {
+    .mast, main { padding-inline: 16px; }
+    .layout { grid-template-columns: minmax(0, 1fr); }
+  }
+  @media (max-width: 500px) {
+    .pair { grid-template-columns: minmax(0, 1fr); }
+    .pair-link { min-width: 0; padding: 5px 12px; }
+    .access-card { min-height: 0; }
+    .chart { padding-inline: 10px; }
+    .chart.split { --node-width: min(218px, calc((100vw - 68px) / 2)); }
+    .chart.split .forest, .chart.split .children { gap: 12px; }
+    .chart.split .node { width: var(--node-width); }
+    .chart.split .edge-label { width: calc(var(--node-width) - 8px); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="mast">
+    <h1>Go 数据竞争派生树</h1>
+    <label class="picker" id="picker" hidden>选择报告 <select id="report"></select></label>
+  </div>
+</header>
+<main>
+  <section class="pair" id="pair" aria-label="冲突访问"></section>
+  <ul id="warnings" class="warnings" hidden></ul>
+  <div class="layout">
+    <section class="panel" aria-labelledby="tree-title">
+      <div class="tree-head">
+        <h2 id="tree-title">Goroutine 派生路径</h2>
+        <p id="relation" class="relation"></p>
+        <div class="legend" aria-label="派生边图例">
+          <span><i></i>已确认创建</span>
+          <span><i class="inferred"></i>源码候选创建</span>
+        </div>
+      </div>
+      <div class="viewport" id="viewport" tabindex="0" aria-label="可滚动的派生树">
+        <div class="chart" id="chart"></div>
+      </div>
+    </section>
+    <aside class="panel detail" id="detail" aria-label="节点与访问详情"></aside>
+  </div>
+  <details class="panel raw" id="original" hidden>
+    <summary id="original-title">原始报告</summary>
+    <pre id="raw"></pre>
+  </details>
+</main>
+<script type="application/json" id="report-data"><!--REPORT_DATA--></script>
+<script>
+  const reports = JSON.parse(document.getElementById('report-data').textContent);
+  const byId = id => document.getElementById(id);
+  const labels = ['A', 'B'];
+  const controls = [];
+  let treeButtons = new Map();
+  let nodes;
+  let report;
+  let observer;
+
+  function element(tag, css, value) {
+    const node = document.createElement(tag);
+    if (css) node.className = css;
+    if (value !== undefined) node.textContent = value;
+    return node;
+  }
+
+  function control(css, label, target, jump) {
+    const button = element('button', css, label);
+    button.type = 'button';
+    button.setAttribute('aria-controls', 'detail');
+    button.setAttribute('aria-pressed', 'false');
+    button.addEventListener('click', () => {
+      select(target);
+      if (jump) {
+        const node = treeButtons.get(target.id);
+        node?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+    });
+    controls.push({ button, target });
+    return button;
+  }
+
+  function name(id) {
+    const node = nodes.get(id);
+    if (node?.context) return node.label || id;
+    const identity = id === 'main' ? 'main goroutine' : /^\d+$/.test(id) ? 'G ' + id : id;
+    return node?.label ? identity + ' · ' + node.label : identity;
+  }
+
+  function fileSite(location, short = false) {
+    if (!location?.file) return '';
+    const file = short ? location.file.split(/[\\/]/).at(-1) : location.file;
+    return file + ':' + location.line + (!short && location.offset ? ' +' + location.offset : '');
+  }
+
+  function displayAccess(access) {
+    return (access.atomic ? '原子' : '') + (access.kind === 'write' ? '写入' : '读取');
+  }
+
+  function lineLabel(line) {
+    return Number.isInteger(line) ? '日志第 ' + line + ' 行' : '';
+  }
+
+  function sourceSite(node) {
+    return node.edge?.site || node.creation?.frames.find(frame => frame.file);
+  }
+
+  function showPair() {
+    const panel = byId('pair');
+    panel.replaceChildren();
+    panel.classList.toggle('single', report.accesses.length < 2);
+    report.accesses.forEach((access, index) => {
+      if (index === 1) {
+        const types = report.accesses.map(item => item.kind);
+        const relation = types.every(t => t === 'write') ? '写写冲突'
+          : types.includes('write') ? '读写冲突' : '报告配对';
+        panel.append(element('div', 'pair-link', relation));
+      }
+      const card = control('access-card', undefined, { id: access.goroutine, index }, true);
+      const top = element('span', 'access-title');
+      top.append(element('span', 'access-letter ' + access.kind, labels[index] + ' · ' + displayAccess(access)));
+      top.append(element('span', '', name(access.goroutine)));
+      if (access.previous) top.append(element('code', 'access-meta', 'Previous'));
+      const frame = access.stack.frames[0];
+      card.append(top, element('span', 'access-symbol', frame?.symbol || '访问函数未知'));
+      card.append(element('span', 'access-meta', [fileSite(frame) || '访问位置未知', access.address].filter(Boolean).join(' · ')));
+      panel.append(card);
+    });
+  }
+
+  function relationText() {
+    const { kind, ancestor, status } = report.relation;
+    if (kind === 'partial') return report.accesses.length ? '仅识别到一处访问' : '缺少可展示的访问';
+    if (kind === 'unknown') return '谱系未知 · 当前证据中没有可连接的祖先路径';
+    if (kind === 'same') return '报告中的两次访问使用同一个 goroutine 标识';
+    const descriptions = { parent: '直接父子', ancestor: '间接祖先', lca: '最近公共祖先' };
+    const prefix = status === 'inferred' ? '候选' : '已确认';
+    return prefix + descriptions[kind] + ' · ' + name(ancestor);
+  }
+
+  function showTree() {
+    observer?.disconnect();
+    const chart = byId('chart');
+    chart.replaceChildren();
+    chart.classList.remove('split');
+    treeButtons = new Map();
+    chart.parentElement.scrollTop = 0;
+    chart.parentElement.scrollLeft = 0;
+    byId('relation').replaceChildren(element('strong', '', relationText()));
+    if (!report.branches.length) {
+      chart.append(element('p', 'empty', '原始报告可在下方查看。'));
+      return;
+    }
+    const paths = new Set(report.relation.children ?? []);
+    const roots = [];
+    const children = new Map();
+    const cards = new Map();
+    for (const node of report.branches) {
+      if (!node.edge) roots.push(node.id);
+      else {
+        const peers = children.get(node.edge.parent) ?? [];
+        peers.push(node.id);
+        children.set(node.edge.parent, peers);
+      }
+    }
+    chart.classList.toggle('split', roots.length > 1 || [...children.values()].some(ids => ids.length > 1));
+    const canvas = element('canvas');
+    canvas.setAttribute('aria-hidden', 'true');
+    const forest = element('div', 'forest');
+    chart.append(canvas, forest);
+
+    function branch(id) {
+      const node = nodes.get(id);
+      const container = element('div', 'branch');
+      if (node.edge) {
+        const site = fileSite(sourceSite(node), true);
+        const label = node.edge.status === 'confirmed' ? '已确认创建' : '源码候选';
+        const seal = element('div', 'edge-label ' + node.edge.status, [label, site].filter(Boolean).join(' · '));
+        seal.title = [fileSite(sourceSite(node)), node.edge.evidence].filter(Boolean).join('\n');
+        container.append(seal);
+      }
+      const card = element('div', 'node');
+      cards.set(id, card);
+      card.classList.toggle('on-path', paths.has(id));
+      card.classList.toggle('is-ancestor', id === report.relation.ancestor);
+      card.classList.toggle('is-context', Boolean(node.context));
+      const title = control('node-button', undefined, { id });
+      treeButtons.set(id, title);
+      title.append(element('span', 'node-name', name(id)));
+      const note = node.context ? '源码上下文' : node.state;
+      const boundary = !node.edge && id !== 'main' && !node.context ? '父实例未知' : '';
+      const creation = !node.edge ? fileSite(sourceSite(node), true) : '';
+      const subtitle = [note, boundary, creation].filter(Boolean).join(' · ');
+      if (subtitle) title.append(element('span', 'node-note', subtitle));
+      card.append(title);
+      const tags = element('div', 'node-accesses');
+      report.accesses.forEach((access, index) => {
+        if (access.goroutine === id) {
+          tags.append(control('access-chip ' + access.kind, labels[index] + ' · ' + displayAccess(access), { id, index }));
+        }
+      });
+      if (tags.childElementCount) card.append(tags);
+      container.append(card);
+      if (children.has(id)) {
+        const row = element('div', 'children');
+        for (const child of children.get(id)) row.append(branch(child));
+        container.append(row);
+      }
+      return container;
+    }
+    for (const root of roots) forest.append(branch(root));
+
+    function drawEdges() {
+      const rect = chart.getBoundingClientRect();
+      const scale = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.ceil(rect.width * scale);
+      canvas.height = Math.ceil(rect.height * scale);
+      canvas.style.width = rect.width + 'px';
+      canvas.style.height = rect.height + 'px';
+      const ctx = canvas.getContext('2d');
+      ctx.scale(scale, scale);
+      for (const node of report.branches) {
+        if (!node.edge) continue;
+        const a = cards.get(node.edge.parent).getBoundingClientRect();
+        const b = cards.get(node.id).getBoundingClientRect();
+        const x = a.left + a.width / 2 - rect.left;
+        const y = a.bottom - rect.top;
+        const bx = b.left + b.width / 2 - rect.left;
+        const by = b.top - rect.top;
+        const turn = y + 11;
+        const inferred = node.edge.status === 'inferred';
+        ctx.strokeStyle = inferred ? '#9a581f' : '#177d73';
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.lineWidth = paths.has(node.id) ? 2.4 : 1.55;
+        ctx.setLineDash(inferred ? [5, 4] : []);
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x, turn);
+        ctx.lineTo(bx, turn);
+        ctx.lineTo(bx, by - 5);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(bx - 4, by - 6);
+        ctx.lineTo(bx + 4, by - 6);
+        ctx.lineTo(bx, by);
+        ctx.fill();
+      }
+    }
+    observer = new ResizeObserver(drawEdges);
+    observer.observe(chart);
+  }
+
+  function section(title) {
+    const part = element('section');
+    part.append(element('h3', '', title));
+    return part;
+  }
+
+  function stackPart(title, stack, missing) {
+    const part = section(title);
+    if (stack?.rawLine) part.append(element('p', '', lineLabel(stack.rawLine)));
+    if (stack?.frames.length) {
+      const list = element('ol', 'frames');
+      for (const frame of stack.frames) {
+        const item = element('li');
+        item.append(element('code', '', frame.symbol || '函数未知'));
+        const meta = [fileSite(frame), lineLabel(frame.rawLine)].filter(Boolean).join(' · ');
+        if (meta) item.append(element('small', 'location', meta));
+        list.append(item);
+      }
+      part.append(list);
+    } else part.append(element('p', '', missing));
+    for (const note of stack?.notes ?? []) part.append(element('p', '', note));
+    return part;
+  }
+
+  function select(target) {
+    for (const { button, target: entry } of controls) {
+      button.setAttribute('aria-pressed', String(entry.id === target.id && entry.index === target.index));
+    }
+    const detail = byId('detail');
+    const node = nodes.get(target.id);
+    const access = report.accesses[target.index];
+    detail.replaceChildren(element('h2', '', name(target.id)));
+    const caption = access ? [labels[target.index] + ' · ' + displayAccess(access), access.previous && 'Previous',
+      access.address, lineLabel(access.rawLine)].filter(Boolean).join(' · ') : node.context ? '源码上下文' : node.state;
+    if (caption) detail.append(element('p', 'caption', caption));
+    if (access) detail.append(stackPart('访问栈', access.stack, '报告缺少此访问的栈帧。'));
+    else {
+      report.accesses.forEach((entry, index) => {
+        if (entry.goroutine === node.id) {
+          detail.append(stackPart(labels[index] + ' · ' + displayAccess(entry) + '访问栈', entry.stack, '报告缺少此访问的栈帧。'));
+        }
+      });
+    }
+    const creation = node.context ? '此节点表示源码调用上下文。' : '报告未提供此 goroutine 的创建栈。';
+    detail.append(stackPart('创建栈 · 创建者侧', node.creation, creation));
+    const evidence = section('父级证据');
+    if (!node.candidates.length) {
+      evidence.append(element('p', '', node.id === 'main' ? '报告标识为 main goroutine。' : '当前证据未定位父 goroutine 实例。'));
+    }
+    for (const entry of node.candidates) {
+      const item = element('div', 'evidence-item');
+      const labels = [entry.status === 'confirmed' ? '同次运行证据' : '源码候选', name(entry.parent),
+        entry.disposition === 'selected' ? '已绘制' : '未绘制', fileSite(entry.site)].filter(Boolean);
+      item.append(element('p', '', labels.join(' · ')), element('p', '', entry.evidence));
+      evidence.append(item);
+    }
+    detail.append(evidence);
+  }
+
+  function show(index) {
+    report = reports[index];
+    nodes = new Map([...report.goroutines, ...report.branches].map(node => [node.id, node]));
+    controls.length = 0;
+    showPair();
+    const warnings = byId('warnings');
+    warnings.replaceChildren(...report.warnings.map(message => element('li', '', message)));
+    warnings.hidden = !report.warnings.length;
+    byId('original').hidden = !report.raw;
+    byId('original').open = false;
+    byId('original-title').textContent = '原始报告 · 从日志第 ' + (report.rawStartLine ?? 1) + ' 行开始';
+    byId('raw').textContent = report.raw ?? '';
+    showTree();
+    if (report.accesses.length) select({ id: report.accesses[0].goroutine, index: 0 });
+    else byId('detail').replaceChildren(element('h2', '', '访问详情'), element('p', 'caption', '此报告没有可识别的访问段。'));
+  }
+
+  const picker = byId('report');
+  reports.forEach((report, index) => {
+    const option = element('option', '', '报告 ' + report.id);
+    option.value = index;
+    picker.append(option);
+  });
+  byId('picker').hidden = reports.length === 1;
+  picker.addEventListener('change', () => show(Number(picker.value)));
+  show(0);
+</script>
+</body>
+</html>
