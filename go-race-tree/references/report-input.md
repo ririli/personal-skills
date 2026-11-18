@@ -40,6 +40,40 @@
 
 `confirmed` 需要同次运行、且能与报告端点 ID 对应的明确证据。创建栈只说明某个 goroutine 的创建位置。Go 报告使用的标识和另一份运行记录的标识需要有已核实的对应关系。在同报告的补充证据中可加 `warnings` 文本数组，说明源码版本、缺失栈或无法核对的路径。没有边时也可仅提供 `id` 与 `warnings`。
 
+## 局部调用路径
+
+`--data` 和 `--evidence` 中每条报告可提供 `callPaths` 数组。补充证据按访问索引替换该访问原有的图示路径。`access: 0` 对应 A，`access: 1` 对应 B。每条路径的 `nodes` 从已知入口或共同调用者排列到竞争访问所在函数，`edges[i]` 连接 `nodes[i]` 到 `nodes[i+1]`。同一访问可提供多条有依据的候选路径，每条均须终止于该访问。
+
+```json
+{
+  "reports": [{
+    "id": 1,
+    "callPaths": [{
+      "access": 0,
+      "nodes": [
+        { "symbol": "main.launch()", "goroutine": "main",
+          "definition": { "file": "main.go", "line": 10 } },
+        { "symbol": "main.worker()", "goroutine": "6", "file": "worker.go", "line": 8,
+          "definition": { "file": "worker.go", "line": 5 } }
+      ],
+      "edges": [{
+        "kind": "go", "status": "inferred", "source": "source",
+        "site": { "file": "main.go", "line": 13 },
+        "evidence": "对应版本的 main.go:13 为 go worker()，创建栈和访问栈分别对应 launch 和 worker。"
+      }]
+    }]
+  }]
+}
+```
+
+示例假定报告 1 的 A 由 G 6 执行，且该报告已声明 main 与 6。
+
+- 节点需要 `symbol`。`definition` 是已核对的函数声明位置，同一文件、声明行及符号表示同一函数，可跨 goroutine 合并。匿名函数和同名函数用各自声明位置区分，重复定义表示递归。缺少声明位置时，仅在该路径内用符号与文件区分，跨路径保持独立。
+- `goroutine` 可省略以表示所属实例未知，填写时须使用本报告已声明的 ID。末节点必须填写竞争访问的 goroutine ID。普通调用两端若都填写 ID，应相同；go 创建两端应不同。函数身份与 goroutine 实例分别记录，函数合并不影响派生树。
+- 节点还可提供 `file`、`line`、`offset`、`rawLine`，表示该路径上报告记录的位置。函数声明位置与实际访问位置分别记录。末节点对应本次访问函数，访问行号以原报告为准。
+- 每条边需要 `kind`（`call` 或 `go`）、`status`（`confirmed` 或 `inferred`）、`source`（`report` 或 `source`）及可核对的 `evidence`。源码边必须有调用位置 `site`，报告边可提供它。这里的 confirmed 表示函数调用关系有明确证据，运行时父 ID 的确认仍由派生树父级证据决定。
+- 缺少 callPaths 的访问由已有栈生成局部图，访问栈按外层到内层绘制，创建栈单独绘制并显示未核对入口的缺口。源码推断、截断栈或无法核对的路径补充到报告 `warnings`。
+
 ## 其他报告格式
 
 用 `--data` 读取与 Go 报告共用的数据模型。一条报告最多两处访问。全文件至少提供一处访问。ID 为报告内的字符串，可用报告自己的标识。若只知道两次访问来自不同执行上下文，各自使用独立 ID 并以 `label` 标注身份未知。

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
-<title>Go 数据竞争派生树</title>
+<title>Go 数据竞争路径</title>
 <style>
   :root {
     color-scheme: light;
@@ -64,7 +64,24 @@
   }
   .pair-link::before, .pair-link::after { content: ""; width: 100%; border-top: 2px dashed #a46023; }
   .warnings { background: #fff7e8; color: #704513; border: 1px solid #efd6a9; border-radius: 8px; padding: 10px 12px 10px 31px; margin-top: 12px; }
-  .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(270px, 33%); align-items: start; gap: 16px; margin-top: 17px; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 16px; margin-top: 17px; }
+  .detail { grid-column: 1 / -1; }
+  .graph-surface { position: relative; min-width: 100%; width: max-content; padding: 26px 34px; }
+  .graph-rows { position: relative; display: grid; gap: 36px; width: max-content; min-width: 100%; }
+  .graph-row { display: flex; justify-content: center; align-items: flex-start; gap: 28px; }
+  .function-node { width: 218px; z-index: 1; }
+  .function-node .node-button { font-family: var(--mono); }
+  .function-node .node-button { padding: 8px 10px; }
+  .function-node .node-name { font-size: .8rem; line-height: 1.4; }
+  .function-node .node-note { font-size: .7rem; line-height: 1.35; }
+  .graph-lines { position: absolute; inset: 0; pointer-events: none; }
+  .graph-edge-label { position: absolute; font-size: .68rem; background: #f9fbfa; padding: 1px 4px; color: #39645f; }
+  .graph-edge-label.go { color: #8a480d; font-weight: 750; }
+  .graph-edge-label.inferred { border: 1px dashed #9a581f; }
+  .linked { outline: 2px solid #17867a; outline-offset: 2px; }
+  .dimmed { opacity: .55; }
+  .graph-gaps { padding: 10px 16px 12px 32px; font-size: .78rem; color: var(--muted); border-top: 1px solid var(--line); }
+  .legend .go { border-top: 3px solid #a45f1d; }
   .panel { min-width: 0; border: 1px solid var(--line); background: #fff; border-radius: 11px; }
   .tree-head { display: grid; gap: 8px; border-bottom: 1px solid var(--line); padding: 15px 17px; }
   h2 { font-size: 1.04rem; font-weight: 750; }
@@ -133,6 +150,9 @@
     .layout { grid-template-columns: minmax(0, 1fr); }
   }
   @media (max-width: 500px) {
+    .function-node { width: min(218px, calc((100vw - 96px) / 2)); }
+    .graph-row { gap: 16px; }
+    .graph-surface { padding-inline: 22px; }
     .pair { grid-template-columns: minmax(0, 1fr); }
     .pair-link { min-width: 0; padding: 5px 12px; }
     .access-card { min-height: 0; }
@@ -147,7 +167,7 @@
 <body>
 <header>
   <div class="mast">
-    <h1>Go 数据竞争派生树</h1>
+    <h1>Go 数据竞争路径</h1>
     <label class="picker" id="picker" hidden>选择报告 <select id="report"></select></label>
   </div>
 </header>
@@ -155,6 +175,21 @@
   <section class="pair" id="pair" aria-label="冲突访问"></section>
   <ul id="warnings" class="warnings" hidden></ul>
   <div class="layout">
+    <section class="panel" aria-labelledby="call-title">
+      <div class="tree-head">
+        <h2 id="call-title">局部调用图</h2>
+        <p class="relation">沿 A、B 两处访问向上溯源</p>
+        <div class="legend">
+          <span><i></i>普通调用</span>
+          <span><i class="go"></i>go 创建</span>
+          <span><i class="inferred"></i>候选边</span>
+        </div>
+      </div>
+      <div class="viewport" tabindex="0" aria-label="可滚动的局部调用图">
+        <div id="call-chart" class="graph-surface"></div>
+      </div>
+      <ul id="call-gaps" class="graph-gaps" hidden></ul>
+    </section>
     <section class="panel" aria-labelledby="tree-title">
       <div class="tree-head">
         <h2 id="tree-title">Goroutine 派生路径</h2>
@@ -185,6 +220,180 @@
   let nodes;
   let report;
   let observer;
+  let callObserver;
+  let functionCards = new Map();
+  let functionEdges = [];
+  let treeCards = new Map();
+  let paintCalls = () => {};
+  let selection = {};
+
+  function highlight(target) {
+    selection = target;
+    const selectedFunction = report.callGraph.nodes.find(node => node.id === target.function);
+    const owners = new Set(selectedFunction?.goroutines ?? [target.id]);
+    for (const node of report.callGraph.nodes) {
+      const matched = selectedFunction ? node.id === target.function
+        : target.index !== undefined ? node.accesses.includes(target.index) : node.goroutines.includes(target.id);
+      functionCards.get(node.id)?.classList.toggle('linked', matched);
+      functionCards.get(node.id)?.classList.toggle('dimmed', !matched);
+    }
+    for (const [id, card] of treeCards) {
+      const matched = owners.has(id);
+      card.classList.toggle('linked', matched);
+      card.classList.toggle('dimmed', !matched);
+    }
+    paintCalls();
+  }
+
+  function showCalls() {
+    callObserver?.disconnect();
+    functionCards = new Map();
+    functionEdges = [];
+    const chart = byId('call-chart');
+    chart.replaceChildren();
+    chart.parentElement.scrollTop = 0;
+    chart.parentElement.scrollLeft = 0;
+    const graph = report.callGraph;
+    const gaps = byId('call-gaps');
+    gaps.replaceChildren(...graph.gaps.map(gap => element('li', '', labels[gap.access] + ' · ' + gap.message)));
+    gaps.hidden = !graph.gaps.length;
+    if (!graph.nodes.length) {
+      chart.append(element('p', 'empty', '当前报告没有可展示的函数栈。'));
+      paintCalls = () => {};
+      return;
+    }
+    // Remove DFS back edges for ranking only. The renderer still draws every edge.
+    const outgoing = new Map(graph.nodes.map(node => [node.id, []]));
+    for (const edge of graph.edges) outgoing.get(edge.from).push(edge);
+    const active = new Set();
+    const visited = new Set();
+    const backEdges = new Set();
+    const order = [];
+    function visit(id) {
+      if (visited.has(id)) return;
+      visited.add(id);
+      active.add(id);
+      for (const edge of outgoing.get(id)) {
+        if (active.has(edge.to)) backEdges.add(edge);
+        else visit(edge.to);
+      }
+      active.delete(id);
+      order.push(id);
+    }
+    graph.nodes.forEach(node => visit(node.id));
+    const ranks = new Map(graph.nodes.map(node => [node.id, 0]));
+    for (const id of order.reverse()) {
+      for (const edge of outgoing.get(id)) {
+        if (!backEdges.has(edge)) ranks.set(edge.to, Math.max(ranks.get(edge.to), ranks.get(id) + 1));
+      }
+    }
+    const layers = new Map();
+    const canvas = element('canvas', 'graph-lines');
+    canvas.setAttribute('aria-hidden', 'true');
+    const rows = element('div', 'graph-rows');
+    chart.append(canvas, rows);
+    for (const node of graph.nodes) {
+      const rank = ranks.get(node.id);
+      if (!layers.has(rank)) layers.set(rank, []);
+      layers.get(rank).push(node);
+    }
+    for (const [, layer] of [...layers].sort((a, b) => a[0] - b[0])) {
+      const row = element('div', 'graph-row');
+      for (const node of layer) {
+        const card = element('div', 'node function-node');
+        const button = control('node-button', undefined, { function: node.id });
+        button.append(element('span', 'node-name', node.symbol));
+        const owners = [...node.goroutines.map(name), ...node.contexts];
+        const membership = '路径 ' + node.accesses.map(index => labels[index]).join('/');
+        button.append(element('span', 'node-note', [membership, ...owners].join(' · ')));
+        card.append(button);
+        const tags = element('div', 'node-accesses');
+        for (const index of [...new Set(node.terminals)]) {
+          tags.append(control('access-chip ' + report.accesses[index].kind,
+            labels[index] + ' · ' + displayAccess(report.accesses[index]), { id: report.accesses[index].goroutine, index }));
+        }
+        if (tags.childElementCount) card.append(tags);
+        row.append(card);
+        functionCards.set(node.id, card);
+      }
+      rows.append(row);
+    }
+    const grouped = new Map();
+    for (const edge of graph.edges) {
+      const key = JSON.stringify([edge.from, edge.to, edge.kind, edge.status, edge.site]);
+      if (!grouped.has(key)) grouped.set(key, { ...edge, accesses: [] });
+      grouped.get(key).accesses.push(edge.access);
+    }
+    const drawnEdges = [...grouped.values()];
+    const labelNodes = drawnEdges.map(edge => {
+      const label = element('span', 'graph-edge-label ' + edge.kind + ' ' + edge.status,
+        [...new Set(edge.accesses)].map(index => labels[index]).join('/') + ' · ' +
+        (edge.kind === 'go' ? 'go' : '调用') + (edge.status === 'inferred' ? ' · 候选' : ''));
+      label.title = [fileSite(edge.site), edge.evidence].filter(Boolean).join('\n');
+      chart.append(label);
+      return label;
+    });
+    functionEdges = graph.edges;
+    paintCalls = () => {
+      const rect = chart.getBoundingClientRect();
+      const scale = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.ceil(rect.width * scale);
+      canvas.height = Math.ceil(rect.height * scale);
+      canvas.style.width = rect.width + 'px';
+      canvas.style.height = rect.height + 'px';
+      const ctx = canvas.getContext('2d');
+      ctx.scale(scale, scale);
+      const bounds = [...functionCards.values()].map(card => card.getBoundingClientRect());
+      drawnEdges.forEach((edge, index) => {
+        const from = functionCards.get(edge.from).getBoundingClientRect();
+        const to = functionCards.get(edge.to).getBoundingClientRect();
+        const back = ranks.get(edge.to) <= ranks.get(edge.from);
+        const long = ranks.get(edge.to) - ranks.get(edge.from) > 1;
+        const side = from.left <= to.left ? -1 : 1;
+        const x = (back ? from.right : long ? (side < 0 ? from.left : from.right) : from.left + from.width / 2) - rect.left;
+        const y = (back || long ? from.top + from.height / 2 : from.bottom) - rect.top;
+        const tx = (back ? to.right : long ? (side < 0 ? to.left : to.right) : to.left + to.width / 2) - rect.left;
+        const ty = (back || long ? to.top + to.height / 2 : to.top) - rect.top;
+        const shift = edge.access === 0 ? -5 : 5;
+        const selected = selection.function !== undefined || selection.index !== undefined || selection.id !== undefined;
+        const matched = !selected || (selection.function ? edge.from === selection.function || edge.to === selection.function
+          : selection.index !== undefined ? edge.accesses.includes(selection.index)
+          : [edge.from, edge.to].some(id => graph.nodes.find(node => node.id === id).goroutines.includes(selection.id)));
+        ctx.globalAlpha = matched ? 1 : .45;
+        ctx.strokeStyle = edge.kind === 'go' ? '#a45f1d' : '#177d73';
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.lineWidth = matched ? 2.3 : 1.3;
+        ctx.setLineDash(edge.status === 'inferred' ? [5, 4] : []);
+        const mid = (y + ty) / 2 + shift;
+        const lane = long ? (side < 0 ? Math.min(...bounds.map(box => box.left)) - 14
+          : Math.max(...bounds.map(box => box.right)) + 14) - rect.left
+          : Math.max(x, tx) + 18 + (index % 3) * 5;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        if (back) {
+          ctx.bezierCurveTo(lane, y - 30, lane, ty + 30, tx, ty);
+        } else if (long) {
+          ctx.lineTo(lane, y);
+          ctx.lineTo(lane, ty);
+          ctx.lineTo(tx, ty);
+        } else {
+          ctx.bezierCurveTo(x, mid, tx, mid, tx, ty - 5);
+        }
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(tx, ty);
+        ctx.lineTo(back ? tx + 7 : long ? tx + side * 7 : tx - 4, back || long ? ty - 4 : ty - 7);
+        ctx.lineTo(back ? tx + 7 : long ? tx + side * 7 : tx + 4, back || long ? ty + 4 : ty - 7);
+        ctx.fill();
+        const label = labelNodes[index];
+        label.style.left = (long ? x : back ? lane - 18 : (x + tx) / 2 - 27) + 'px';
+        label.style.top = (long ? from.bottom - rect.top + 6 : back ? mid : mid - 10) + 'px';
+        label.classList.toggle('dimmed', !matched);
+      });
+    };
+    callObserver = new ResizeObserver(paintCalls);
+    callObserver.observe(chart);
+  }
 
   function element(tag, css, value) {
     const node = document.createElement(tag);
@@ -273,6 +482,7 @@
     chart.replaceChildren();
     chart.classList.remove('split');
     treeButtons = new Map();
+    treeCards = new Map();
     chart.parentElement.scrollTop = 0;
     chart.parentElement.scrollLeft = 0;
     byId('relation').replaceChildren(element('strong', '', relationText()));
@@ -284,6 +494,7 @@
     const roots = [];
     const children = new Map();
     const cards = new Map();
+    treeCards = cards;
     for (const node of report.branches) {
       if (!node.edge) roots.push(node.id);
       else {
@@ -403,11 +614,35 @@
     return part;
   }
 
-  function select(target) {
+  function select(target, emphasize = true) {
     for (const { button, target: entry } of controls) {
-      button.setAttribute('aria-pressed', String(entry.id === target.id && entry.index === target.index));
+      button.setAttribute('aria-pressed', String(entry.function === target.function &&
+        entry.id === target.id && entry.index === target.index));
     }
+    if (emphasize) highlight(target);
     const detail = byId('detail');
+    if (target.function) {
+      const fn = report.callGraph.nodes.find(node => node.id === target.function);
+      detail.replaceChildren(element('h2', '', fn.symbol));
+      detail.append(element('p', 'caption', fn.goroutines.map(name).concat(fn.contexts).join(' · ')));
+      if (fn.definition) detail.append(element('p', 'caption', '函数定义 · ' + fileSite(fn.definition)));
+      detail.append(stackPart('函数位置与关联访问', {
+        frames: fn.frames.map(frame => ({ ...frame, symbol: labels[frame.access] + ' · ' + frame.symbol })),
+      }, '函数位置未知。'));
+      const part = section('关联调用边');
+      for (const edge of functionEdges.filter(edge => edge.from === fn.id || edge.to === fn.id)) {
+        const names = new Map(report.callGraph.nodes.map(node => [node.id, node.symbol]));
+        const item = element('div', 'evidence-item');
+        item.append(element('p', '', [labels[edge.access], names.get(edge.from),
+          edge.kind === 'go' ? 'go 创建 →' : '调用 →', names.get(edge.to),
+          edge.status === 'inferred' ? '候选' : '已确认',
+          edge.source === 'source' ? '源码' : '报告', fileSite(edge.site)].filter(Boolean).join(' · ')));
+        item.append(element('p', '', edge.evidence));
+        part.append(item);
+      }
+      detail.append(part);
+      return;
+    }
     const node = nodes.get(target.id);
     const access = report.accesses[target.index];
     detail.replaceChildren(element('h2', '', name(target.id)));
@@ -440,6 +675,7 @@
 
   function show(index) {
     report = reports[index];
+    selection = {};
     nodes = new Map([...report.goroutines, ...report.branches].map(node => [node.id, node]));
     controls.length = 0;
     showPair();
@@ -451,7 +687,8 @@
     byId('original-title').textContent = '原始报告 · 从日志第 ' + (report.rawStartLine ?? 1) + ' 行开始';
     byId('raw').textContent = report.raw ?? '';
     showTree();
-    if (report.accesses.length) select({ id: report.accesses[0].goroutine, index: 0 });
+    showCalls();
+    if (report.accesses.length) select({ id: report.accesses[0].goroutine, index: 0 }, false);
     else byId('detail').replaceChildren(element('h2', '', '访问详情'), element('p', 'caption', '此报告没有可识别的访问段。'));
   }
 

@@ -1,3 +1,5 @@
+import { buildCallGraph } from './callgraph.mjs';
+
 const warning = /^\s*WARNING: DATA RACE\s*$/i;
 const separator = /^\s*={8,}\s*$/;
 const accessHeader = /^\s*(Previous\s+)?(Atomic\s+)?(Read|Write)(?:\s+at\s+(0x[\da-f]+))?\s+by\s+(?:goroutine\s+(\d+)|(main goroutine)):\s*$/i;
@@ -278,7 +280,14 @@ function derive(report, extra = {}) {
   }));
   if (!report.accesses.length) warnings.push('此条报告没有可展示的访问。');
   if (report.accesses.length === 1) warnings.push('仅识别到一处访问，冲突的另一端缺失。');
-  return { ...report, warnings, branches, relation, goroutines: [...nodes.values()] };
+  const view = { ...report, warnings, branches, relation, goroutines: [...nodes.values()] };
+  requireValue(report.callPaths === undefined || Array.isArray(report.callPaths), 'callPaths 必须是数组。');
+  requireValue(extra.callPaths === undefined || Array.isArray(extra.callPaths), 'callPaths 必须是数组。');
+  const replacedAccesses = new Set((extra.callPaths ?? []).map(path => path?.access));
+  const callPaths = [...(report.callPaths ?? []).filter(path => !replacedAccesses.has(path?.access)),
+    ...(extra.callPaths ?? [])];
+  view.callGraph = buildCallGraph(view, callPaths);
+  return view;
 }
 
 export function buildView(reports, evidence = { reports: [] }) {
